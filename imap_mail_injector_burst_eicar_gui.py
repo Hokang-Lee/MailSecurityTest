@@ -11,17 +11,20 @@ import argparse
 import importlib.util
 import json
 import queue
+import ssl
 import threading
 import time
 import tkinter as tk
+from datetime import datetime
 from pathlib import Path
-from tkinter import messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox, scrolledtext, ttk
 from urllib.parse import urlparse
 
 
 HERE = Path(__file__).resolve().parent
 CLI_PATH = HERE / "imap_mail_injector_burst_eicar.py"
 SETTINGS_PATH = HERE / "imap_mail_injector_burst_eicar_gui_settings.json"
+LOG_DIR = HERE / "logs"
 UNSAVED_SETTINGS = {"smtp_password", "show_password"}
 
 
@@ -46,6 +49,9 @@ class MailSecurityApp(tk.Tk):
 
         self.cli = load_cli()
         self.log_queue: queue.Queue[str] = queue.Queue()
+        self.log_file_path: Path | None = None
+        self.log_file_lock = threading.Lock()
+        self.settings_path = SETTINGS_PATH
         self.worker: threading.Thread | None = None
         self.vars: dict[str, tk.Variable] = {}
         self._build_ui()
@@ -84,8 +90,10 @@ class MailSecurityApp(tk.Tk):
         self._entry(smtp, 2, 0, "AUTHユーザー", "smtp_user", "")
         self.password_entry = self._entry(smtp, 2, 2, "AUTHパスワード", "smtp_password", "", show="*")
         self._check(smtp, 3, 0, "EHLOを明示実行", "ehlo", False)
-        self._check(smtp, 3, 1, "STARTTLS", "starttls", False)
-        self._check(smtp, 3, 2, "パスワード表示", "show_password", False).configure(command=self._toggle_password)
+        self._check(smtp, 3, 1, "通常SMTP（25）", "plain_smtp", True).configure(command=self._select_plain_smtp)
+        self._check(smtp, 3, 2, "STARTTLS（587）", "starttls", False).configure(command=self._select_starttls)
+        self._check(smtp, 3, 3, "SSL/TLS（465）", "implicit_ssl", False).configure(command=self._select_implicit_ssl)
+        self._check(smtp, 4, 0, "パスワード表示", "show_password", False).configure(command=self._toggle_password)
 
         recipients = ttk.LabelFrame(outer, text="宛先・送信設定", padding=8)
         recipients.pack(fill="x", pady=(0, 8))
@@ -94,7 +102,7 @@ class MailSecurityApp(tk.Tk):
         self._entry(recipients, 0, 0, "接頭辞", "user_prefix", self.cli.DEFAULT_USER_PREFIX, 12)
         self._entry(recipients, 0, 2, "開始番号", "user_start", str(self.cli.DEFAULT_USER_START), 12)
         self._entry(recipients, 0, 4, "終了番号", "user_end", str(self.cli.DEFAULT_USER_END), 12)
-        self._entry(recipients, 1, 0, "桁数", "user_width", str(self.cli.DEFAULT_USER_WIDTH), 12)
+        self._entry(recipients, 1, 0, "桁数（0=単一宛先）", "user_width", str(self.cli.DEFAULT_USER_WIDTH), 16)
         self._entry(recipients, 1, 2, "ドメイン", "domain", self.cli.DEFAULT_DOMAIN, 18)
         self._entry(recipients, 1, 4, "並列数", "workers", str(self.cli.DEFAULT_WORKERS), 12)
         self._entry(recipients, 2, 0, "バースト回数", "burst_count", "1", 12)
@@ -118,6 +126,7 @@ class MailSecurityApp(tk.Tk):
         self.stop_button.pack(side="left")
         ttk.Button(controls, text="設定を保存", command=self._save_settings).pack(side="left", padx=(12, 6))
         ttk.Button(controls, text="設定を再読込", command=lambda: self._load_settings(True)).pack(side="left")
+        ttk.Button(controls, text="JSONを選んで読込", command=self._choose_settings_file).pack(side="left", padx=(6, 0))
         self.status_var = tk.StringVar(self, "待機中")
         ttk.Label(controls, textvariable=self.status_var).pack(side="left", padx=14)
 
@@ -136,12 +145,46 @@ class MailSecurityApp(tk.Tk):
     def _toggle_password(self):
         self.password_entry.configure(show="" if self.vars["show_password"].get() else "*")
 
+    def _select_plain_smtp(self) -> None:
+        if self.vars["plain_smtp"].get():
+            self.vars["starttls"].set(False)
+            self.vars["implicit_ssl"].set(False)
+            self.vars["port"].set("25")
+        else:
+            self.vars["plain_smtp"].set(True)
+
+    def _select_starttls(self) -> None:
+        if self.vars["starttls"].get():
+            self.vars["plain_smtp"].set(False)
+            self.vars["implicit_ssl"].set(False)
+            self.vars["port"].set("587")
+        else:
+            self.vars["starttls"].set(True)
+
+    def _select_implicit_ssl(self) -> None:
+        if self.vars["implicit_ssl"].get():
+            self.vars["plain_smtp"].set(False)
+            self.vars["starttls"].set(False)
+            self.vars["port"].set("465")
+        else:
+            self.vars["implicit_ssl"].set(True)
+
+    def _normalize_transport_selection(self) -> None:
+        """Normalize old settings without replacing a saved custom port."""
+        if self.vars["implicit_ssl"].get():
+            self.vars["plain_smtp"].set(False)
+            self.vars["starttls"].set(False)
+        elif self.vars["starttls"].get():
+            self.vars["plain_smtp"].set(False)
+        else:
+            self.vars["plain_smtp"].set(True)
+
     def _settings_data(self) -> dict[str, object]:
         return {name: var.get() for name, var in self.vars.items() if name not in UNSAVED_SETTINGS}
 
     def _save_settings(self, show_message: bool = True) -> bool:
         try:
-            SETTINGS_PATH.write_text(
+            self.settings_path.write_text(
                 json.dumps(self._settings_data(), ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )
@@ -152,28 +195,49 @@ class MailSecurityApp(tk.Tk):
         if show_message:
             messagebox.showinfo(
                 "設定保存",
-                f"設定を保存しました。\n{SETTINGS_PATH}\n\nSMTPパスワードは保存されません。",
+                f"設定を保存しました。\n{self.settings_path}\n\nSMTPパスワードは保存されません。",
                 parent=self,
             )
         return True
 
-    def _load_settings(self, show_message: bool = True) -> None:
-        if not SETTINGS_PATH.exists():
+    def _choose_settings_file(self) -> None:
+        selected = filedialog.askopenfilename(
+            parent=self,
+            title="読み込む設定JSONを選択",
+            initialdir=str(HERE),
+            filetypes=(("JSON設定ファイル", "*.json"), ("すべてのファイル", "*.*")),
+        )
+        if selected:
+            self._load_settings(show_message=True, path=Path(selected))
+
+    def _load_settings(self, show_message: bool = True, path: Path | None = None) -> None:
+        source_path = path or self.settings_path
+        if not source_path.exists():
             if show_message:
                 messagebox.showinfo("設定再読込", "保存済みの設定はありません。", parent=self)
             return
         try:
-            data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+            data = json.loads(source_path.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 raise ValueError("設定ファイルの形式が正しくありません")
             for name, value in data.items():
                 if name in self.vars and name not in UNSAVED_SETTINGS:
                     self.vars[name].set(value)
+            self._normalize_transport_selection()
+            self.settings_path = source_path
         except (OSError, ValueError, json.JSONDecodeError) as exc:
-            messagebox.showerror("設定読込エラー", f"設定を読み込めませんでした。\n{exc}", parent=self)
+            messagebox.showerror(
+                "設定読込エラー",
+                f"設定を読み込めませんでした。\n{source_path}\n\n{exc}",
+                parent=self,
+            )
             return
         if show_message:
-            messagebox.showinfo("設定再読込", "保存済みの設定を読み込みました。", parent=self)
+            messagebox.showinfo(
+                "設定再読込",
+                f"設定を読み込みました。\n{source_path}\n\nSMTPパスワードは読み込まれません。",
+                parent=self,
+            )
 
     def _value(self, name: str) -> str:
         return str(self.vars[name].get()).strip()
@@ -198,13 +262,22 @@ class MailSecurityApp(tk.Tk):
             return value
 
         start, end = integer("user_start", 0), integer("user_end", 0)
-        if end < start:
+        user_width = integer("user_width", 0)
+        if user_width > 0 and end < start:
             raise ValueError("終了番号は開始番号以上にしてください")
+        if user_width == 0:
+            end = start
         host = self._value("host")
         from_addr = self._value("from_addr")
         domain = self._value("domain")
         if not host or not from_addr or not domain:
             raise ValueError("ホスト、送信元、ドメインは必須です")
+        transport_count = sum(
+            bool(self.vars[name].get())
+            for name in ("plain_smtp", "starttls", "implicit_ssl")
+        )
+        if transport_count != 1:
+            raise ValueError("SMTP接続方式は1つだけ選択してください")
         spam_url = self._value("spam_url")
         if self.vars["spam_url_enabled"].get():
             parsed = urlparse(spam_url)
@@ -213,7 +286,7 @@ class MailSecurityApp(tk.Tk):
         return argparse.Namespace(
             host=host, port=integer("port", 1), from_addr=from_addr, domain=domain,
             user_prefix=self._value("user_prefix"), user_start=start, user_end=end,
-            user_width=integer("user_width", 1), interval=number("interval", 0),
+            user_width=user_width, interval=number("interval", 0),
             timeout=integer("timeout", 1), workers=integer("workers", 1),
             burst_count=integer("burst_count", 0), dry_run=bool(self.vars["dry_run"].get()),
             progress_every=integer("progress_every", 0),
@@ -221,13 +294,31 @@ class MailSecurityApp(tk.Tk):
             eicar_filename=self._value("eicar_filename") or "eicar.com",
             spam_url_enabled=bool(self.vars["spam_url_enabled"].get()), spam_url=spam_url,
             subject_prefix=self._value("subject_prefix"), ehlo=bool(self.vars["ehlo"].get()),
-            starttls=bool(self.vars["starttls"].get()), smtp_user=self._value("smtp_user"),
+            starttls=bool(self.vars["starttls"].get()),
+            implicit_ssl=bool(self.vars["implicit_ssl"].get()), smtp_user=self._value("smtp_user"),
             smtp_password=str(self.vars["smtp_password"].get()),
         )
 
     def _log(self, message: str) -> None:
         stamp = time.strftime("%H:%M:%S")
-        self.log_queue.put(f"[{stamp}] {message}\n")
+        line = f"[{stamp}] {message}\n"
+        self.log_queue.put(line)
+        if self.log_file_path is not None:
+            try:
+                with self.log_file_lock:
+                    with self.log_file_path.open("a", encoding="utf-8", newline="") as log_file:
+                        log_file.write(line)
+            except OSError:
+                # GUI送信処理は継続する。ファイル書込みエラーの再帰ログは避ける。
+                pass
+
+    def _start_log_file(self) -> Path:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        path = LOG_DIR / f"send_{stamp}.log"
+        path.write_text("", encoding="utf-8")
+        self.log_file_path = path
+        return path
 
     def _drain_log(self) -> None:
         try:
@@ -259,7 +350,14 @@ class MailSecurityApp(tk.Tk):
                 warning += f"\n\nスパム試験URLを本文に追加します:\n{args.spam_url}"
             if not messagebox.askyesno("実送信の確認", warning + "\n\n許可済み試験環境ですか？", parent=self):
                 return
+        send_time_suffix = datetime.now().strftime("%H%M")
+        args.subject_prefix = f"{args.subject_prefix}{send_time_suffix}"
         self._save_settings(show_message=False)
+        try:
+            log_path = self._start_log_file()
+        except OSError as exc:
+            messagebox.showerror("ログ保存エラー", f"送信ログファイルを作成できませんでした。\n{exc}", parent=self)
+            return
         self.cli.STOP_EVENT.clear()
         self.cli.log = self._log
         self.start_button.configure(state="disabled")
@@ -267,12 +365,25 @@ class MailSecurityApp(tk.Tk):
         self.status_var.set("実行中")
         self.progress.start(12)
         self.worker = threading.Thread(target=self._run, args=(args,), daemon=True)
+        self._log(f"ログ保存先: {log_path}")
+        self._log(f"今回の件名接頭辞: {args.subject_prefix}")
         self.worker.start()
 
     def _run(self, args) -> None:
         total_ok = total_ng = burst_no = 0
-        self._log(f"開始: {args.host}:{args.port} / 宛先 {args.user_start}～{args.user_end} / dry-run={args.dry_run}")
+        if args.user_width == 0:
+            recipient_description = f"{args.user_prefix}@{args.domain}（単一宛先）"
+        else:
+            recipient_description = f"番号 {args.user_start}～{args.user_end}"
+        self._log(f"開始: {args.host}:{args.port} / 宛先 {recipient_description} / dry-run={args.dry_run}")
         original_make_message = self.cli.make_message
+        original_make_address = self.cli.make_address
+        original_send_one = self.cli.send_one
+
+        def make_address_with_single_mode(prefix, number, width, domain):
+            if width == 0:
+                return f"{prefix}@{domain}"
+            return original_make_address(prefix, number, width, domain)
 
         def make_message_with_url(cli_args, to_addr, burst_no_value, seq_no):
             msg = original_make_message(cli_args, to_addr, burst_no_value, seq_no)
@@ -285,7 +396,37 @@ class MailSecurityApp(tk.Tk):
                 msg.attach(self.cli.MIMEText(text, "plain", "utf-8"))
             return msg
 
+        def send_one_with_recipient_log(cli_args, to_addr, msg):
+            if cli_args.implicit_ssl and not cli_args.dry_run:
+                try:
+                    context = ssl.create_default_context()
+                    with self.cli.smtplib.SMTP_SSL(
+                        cli_args.host,
+                        cli_args.port,
+                        timeout=cli_args.timeout,
+                        context=context,
+                    ) as smtp:
+                        if cli_args.ehlo:
+                            smtp.ehlo()
+                        if cli_args.smtp_user:
+                            smtp.login(cli_args.smtp_user, cli_args.smtp_password)
+                        smtp.sendmail(cli_args.from_addr, [to_addr], msg.as_string())
+                    result = (True, "ok")
+                except Exception as exc:
+                    result = (False, f"{type(exc).__name__}: {str(exc)[:200]}")
+            else:
+                result = original_send_one(cli_args, to_addr, msg)
+            success, info = result
+            if success:
+                if cli_args.dry_run:
+                    self._log(f"DRY-RUN {to_addr}: 実送信なし")
+                else:
+                    self._log(f"SENT {to_addr}")
+            return result
+
+        self.cli.make_address = make_address_with_single_mode
         self.cli.make_message = make_message_with_url
+        self.cli.send_one = send_one_with_recipient_log
         try:
             while not self.cli.STOP_EVENT.is_set():
                 burst_no += 1
@@ -298,7 +439,9 @@ class MailSecurityApp(tk.Tk):
         except Exception as exc:
             self._log(f"ERROR: {type(exc).__name__}: {exc}")
         finally:
+            self.cli.make_address = original_make_address
             self.cli.make_message = original_make_message
+            self.cli.send_one = original_send_one
             self._log(f"終了: bursts={burst_no} total_ok={total_ok} total_ng={total_ng}")
             self.after(0, self._finished)
 
