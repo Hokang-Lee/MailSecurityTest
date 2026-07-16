@@ -8,6 +8,7 @@ CLI's message construction and SMTP/burst functions; the original is unchanged.
 from __future__ import annotations
 
 import argparse
+import base64
 import importlib.util
 import json
 import queue
@@ -15,6 +16,10 @@ import ssl
 import threading
 import time
 import tkinter as tk
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
@@ -26,6 +31,7 @@ CLI_PATH = HERE / "imap_mail_injector_burst_eicar.py"
 SETTINGS_PATH = HERE / "imap_mail_injector_burst_eicar_gui_settings.json"
 LOG_DIR = HERE / "logs"
 UNSAVED_SETTINGS = {"smtp_password", "show_password"}
+MICROSOFT_SMTP_SCOPE = "https://outlook.office.com/SMTP.Send offline_access"
 
 
 def load_cli():
@@ -96,6 +102,10 @@ class MailSecurityApp(tk.Tk):
         self._check(smtp, 4, 0, "パスワード表示", "show_password", False).configure(command=self._toggle_password)
 
         recipients = ttk.LabelFrame(outer, text="宛先・送信設定", padding=8)
+        self._check(smtp, 4, 2, "Microsoft OAuth 2.0", "oauth_enabled", False)
+        self._entry(smtp, 5, 0, "Entra テナントID", "oauth_tenant_id", "", 34)
+        self._entry(smtp, 5, 2, "Entra クライアントID", "oauth_client_id", "", 34)
+
         recipients.pack(fill="x", pady=(0, 8))
         for c in (1, 3, 5):
             recipients.columnconfigure(c, weight=1)
@@ -283,6 +293,14 @@ class MailSecurityApp(tk.Tk):
             parsed = urlparse(spam_url)
             if parsed.scheme not in ("http", "https") or not parsed.netloc:
                 raise ValueError("スパム試験URLは http:// または https:// から始まる完全なURLにしてください")
+        oauth_enabled = bool(self.vars["oauth_enabled"].get())
+        if oauth_enabled:
+            if not self._value("oauth_tenant_id") or not self._value("oauth_client_id"):
+                raise ValueError("OAuth使用時はテナントIDとクライアントIDが必要です")
+            if not self._value("smtp_user"):
+                raise ValueError("OAuth使用時はAUTHユーザー（Microsoft 365メールアドレス）が必要です")
+            if not self.vars["starttls"].get() or self.vars["implicit_ssl"].get():
+                raise ValueError("Microsoft OAuth送信ではSTARTTLS（ポート587）を選択してください")
         return argparse.Namespace(
             host=host, port=integer("port", 1), from_addr=from_addr, domain=domain,
             user_prefix=self._value("user_prefix"), user_start=start, user_end=end,
@@ -297,7 +315,98 @@ class MailSecurityApp(tk.Tk):
             starttls=bool(self.vars["starttls"].get()),
             implicit_ssl=bool(self.vars["implicit_ssl"].get()), smtp_user=self._value("smtp_user"),
             smtp_password=str(self.vars["smtp_password"].get()),
+            oauth_enabled=oauth_enabled,
+            oauth_tenant_id=self._value("oauth_tenant_id"),
+            oauth_client_id=self._value("oauth_client_id"),
         )
+
+    @staticmethod
+    def _post_form_json(url: str, form: dict[str, str]) -> dict:
+        data = urllib.parse.urlencode(form).encode("ascii")
+        request = urllib.request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=15) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def _acquire_microsoft_token(self, args) -> str:
+        tenant = urllib.parse.quote(args.oauth_tenant_id, safe="")
+        base_url = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0"
+        device = self._post_form_json(
+            f"{base_url}/devicecode",
+            {"client_id": args.oauth_client_id, "scope": MICROSOFT_SMTP_SCOPE},
+        )
+        device_code = device["device_code"]
+        user_code = device["user_code"]
+        verification_uri = device.get("verification_uri") or device.get("verification_url")
+        expires_at = time.monotonic() + int(device.get("expires_in", 900))
+        interval = max(1, int(device.get("interval", 5)))
+        self._log(f"Microsoft OAuth認証待ち: {verification_uri} / ログインコード: {user_code}")
+
+        def show_sign_in() -> None:
+            messagebox.showinfo(
+                "Microsoft OAuth認証",
+                f"ブラウザーでMicrosoftにサインインしてください。\n\nURL: {verification_uri}\nコード: {user_code}",
+                parent=self,
+            )
+            if verification_uri:
+                webbrowser.open(verification_uri)
+
+        self.after(0, show_sign_in)
+        token_url = f"{base_url}/token"
+        form = {
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            "client_id": args.oauth_client_id,
+            "device_code": device_code,
+        }
+        while time.monotonic() < expires_at:
+            if self.cli.STOP_EVENT.wait(interval):
+                raise InterruptedError("OAuth認証を中止しました")
+            try:
+                token = self._post_form_json(token_url, form)
+            except urllib.error.HTTPError as exc:
+                try:
+                    detail = json.loads(exc.read().decode("utf-8"))
+                except (ValueError, UnicodeDecodeError):
+                    raise RuntimeError(f"Microsoftトークン取得エラー: HTTP {exc.code}") from exc
+                error = detail.get("error", "unknown_error")
+                if error == "authorization_pending":
+                    continue
+                if error == "slow_down":
+                    interval += 5
+                    continue
+                description = detail.get("error_description", error).splitlines()[0]
+                raise RuntimeError(f"Microsoft OAuthエラー: {description}") from exc
+            access_token = token.get("access_token")
+            if not access_token:
+                raise RuntimeError("Microsoftからアクセストークンが返されませんでした")
+            self._log("Microsoft OAuth認証に成功しました")
+            return str(access_token)
+        raise TimeoutError("Microsoft OAuth認証の有効時間が切れました")
+
+    def _send_one_oauth(self, cli_args, to_addr, msg):
+        try:
+            with self.cli.smtplib.SMTP(
+                cli_args.host, cli_args.port, timeout=cli_args.timeout
+            ) as smtp:
+                smtp.ehlo()
+                smtp.starttls(context=ssl.create_default_context())
+                smtp.ehlo()
+                xoauth2 = (
+                    f"user={cli_args.smtp_user}\x01"
+                    f"auth=Bearer {cli_args.oauth_access_token}\x01\x01"
+                )
+                encoded = base64.b64encode(xoauth2.encode("utf-8")).decode("ascii")
+                code, response = smtp.docmd("AUTH", "XOAUTH2 " + encoded)
+                if code != 235:
+                    raise self.cli.smtplib.SMTPAuthenticationError(code, response)
+                smtp.sendmail(cli_args.from_addr, [to_addr], msg.as_string())
+            return True, "ok"
+        except Exception as exc:
+            return False, f"{type(exc).__name__}: {str(exc)[:200]}"
 
     def _log(self, message: str) -> None:
         stamp = time.strftime("%H:%M:%S")
@@ -372,6 +481,13 @@ class MailSecurityApp(tk.Tk):
 
     def _run(self, args) -> None:
         total_ok = total_ng = burst_no = 0
+        if args.oauth_enabled and not args.dry_run:
+            try:
+                args.oauth_access_token = self._acquire_microsoft_token(args)
+            except Exception as exc:
+                self._log(f"OAuth ERROR: {type(exc).__name__}: {exc}")
+                self.after(0, self._finished)
+                return
         if args.user_width == 0:
             recipient_description = f"{args.user_prefix}@{args.domain}（単一宛先）"
         else:
@@ -398,7 +514,9 @@ class MailSecurityApp(tk.Tk):
             return msg
 
         def send_one_with_recipient_log(cli_args, to_addr, msg):
-            if cli_args.implicit_ssl and not cli_args.dry_run:
+            if cli_args.oauth_enabled and not cli_args.dry_run:
+                result = self._send_one_oauth(cli_args, to_addr, msg)
+            elif cli_args.implicit_ssl and not cli_args.dry_run:
                 try:
                     context = ssl.create_default_context()
                     with self.cli.smtplib.SMTP_SSL(
