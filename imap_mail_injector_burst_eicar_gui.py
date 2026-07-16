@@ -314,9 +314,9 @@ class MailSecurityApp(tk.Tk):
 
     def _start_log_file(self) -> Path:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        stamp = datetime.now().strftime("%Y%m%d")
         path = LOG_DIR / f"send_{stamp}.log"
-        path.write_text("", encoding="utf-8")
+        path.touch(exist_ok=True)
         self.log_file_path = path
         return path
 
@@ -365,6 +365,7 @@ class MailSecurityApp(tk.Tk):
         self.status_var.set("実行中")
         self.progress.start(12)
         self.worker = threading.Thread(target=self._run, args=(args,), daemon=True)
+        self._log("-" * 60)
         self._log(f"ログ保存先: {log_path}")
         self._log(f"今回の件名接頭辞: {args.subject_prefix}")
         self.worker.start()
