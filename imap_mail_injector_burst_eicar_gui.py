@@ -461,7 +461,6 @@ class MailSecurityApp(tk.Tk):
                 return
         send_time_suffix = datetime.now().strftime("%H%M")
         args.subject_prefix = f"{args.subject_prefix}{send_time_suffix}"
-        self._save_settings(show_message=False)
         try:
             log_path = self._start_log_file()
         except OSError as exc:
@@ -582,7 +581,6 @@ class MailSecurityApp(tk.Tk):
             if not messagebox.askyesno("終了確認", "送信処理中です。停止要求を出して終了しますか？", parent=self):
                 return
             self.cli.STOP_EVENT.set()
-        self._save_settings(show_message=False)
         self.destroy()
 
 
